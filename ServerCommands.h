@@ -7,6 +7,10 @@ enum class ServerCommands
 	help,
 	signup,
 	login,
+	getlist,
+	logout,
+	getlog,
+	send,
 
 	Unknown,
 };
@@ -22,7 +26,11 @@ inline ServerCommands CommandFromToken(const char* cmd)
 		size_t space = string.find(' ');
 
 		//Token found
-		if (space != std::string::npos)
+		if (space == std::string::npos)
+		{
+			token = string;
+		}
+		else 
 		{
 			token = string.substr(0, space);
 		}
@@ -31,6 +39,11 @@ inline ServerCommands CommandFromToken(const char* cmd)
 	if (token == "~help") return ServerCommands::help;
 	if (token == "~register") return ServerCommands::signup;
 	if (token == "~login") return ServerCommands::login;
+	if (token == "~getlist") return ServerCommands::getlist;
+	if (token == "~logout") return ServerCommands::logout;
+	if (token == "~getlog") return ServerCommands::getlog;
+	if (token == "~send") return ServerCommands::send;
+
 
 	return ServerCommands::Unknown;
 }

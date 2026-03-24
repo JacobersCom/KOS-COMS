@@ -3,10 +3,72 @@
 #include "HashTable.h"
 #include "ServerCommands.h"
 
+constexpr const char* PublicLogPath = "PublicLog.txt";
+
 bool Server::LoggedIn(SOCKET s)
 {
 	//if socket is not found in map return false
 	return SocketToUser.find(s) != SocketToUser.end();
+}
+
+KReturn Server::ServerMessage(SOCKET s, std::string text)
+{
+	if(text != "")
+	{
+		std::string out = "[SERVER]" + text;
+		send_packet(s, out.c_str());
+		return KReturn::SUCCESS;
+	}
+	return KReturn::UNKNOWN;
+}
+
+void Server::logPublic(const std::string& line)
+{
+	
+	if (!PublicLog.is_open()) return;
+	PublicLog << line << "\n";
+	PublicLog.flush();
+}
+
+void Server::StartBroadCast(uint16_t port, uint32_t intervalseconds)
+{
+	AdvertisedServerPort = port;
+	UdpBroadcastRunning = true;
+
+	//Starts a new thread and runs my broad cast loop on it
+	UdpBroadcastThread = std::thread(&Server::BroadCastLoop, this, intervalseconds);
+}
+
+
+void Server::BroadCastPublic(SOCKET s, std::string& text)
+{
+
+	const std::string user = SocketToUser.find(s)->second;
+	if (user.empty())
+		return;
+
+	std::string out = user + ": " + text + "\n";
+	for (const auto& kv : SocketToUser)
+	{
+		
+		send_packet(kv.first, out.c_str());
+	}
+
+	logPublic(user + ": " + text);
+}
+
+std::string Server::BuildBroadcastMessage() const
+{
+	return "KOS_COMS|TCP_PORT=" + std::to_string(AdvertisedServerPort);
+}
+
+void Server::StopBroadCast()
+{
+	UdpBroadcastRunning = false;
+	if (UdpBroadcastThread.joinable())
+	{
+		UdpBroadcastThread.join();
+	}
 }
 
 KReturn Server::Init(uint16_t port, uint32_t ChatCap)
@@ -14,8 +76,10 @@ KReturn Server::Init(uint16_t port, uint32_t ChatCap)
 	WSADATA WsaData;
 	int ErrCode = 0;
 
-	int result = WSAStartup(MAKEWORD(2, 2), &WsaData);
-	if (result < 0)
+	PublicLog.open(PublicLogPath, std::ios::app);
+
+	int resultTCP = WSAStartup(MAKEWORD(2, 2), &WsaData);
+	if (resultTCP < 0)
 	{
 		ErrCode = WSAGetLastError();
 		printf("Failed to start WSA. Error: %d", ErrCode);
@@ -37,8 +101,7 @@ KReturn Server::Init(uint16_t port, uint32_t ChatCap)
 	serverAddr.sin_addr.S_un.S_addr = INADDR_ANY;
 	serverAddr.sin_port = htons(port);
 
-	result = bind(ListenSocket, (sockaddr*)&serverAddr, sizeof(serverAddr));
-	if(result < 0)
+	if(bind(ListenSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)))
 	{
 		ErrCode = WSAGetLastError();
 		printf("Failed to bind socket to port. Error: %d", ErrCode);
@@ -46,8 +109,8 @@ KReturn Server::Init(uint16_t port, uint32_t ChatCap)
 	}
 
 	//Awaiting connections
-	result = listen(ListenSocket, 0);
-	if (result < 0)
+	resultTCP = listen(ListenSocket, 0);
+	if (resultTCP < 0)
 	{
 		ErrCode = WSAGetLastError();
 		printf("Socket Error. Error: %d", ErrCode);
@@ -57,7 +120,7 @@ KReturn Server::Init(uint16_t port, uint32_t ChatCap)
 	}
 	
 	printf("Server listening on port: %d \n", port);
-
+	StartBroadCast(port, 5);
 	//Setting up sets
 
 	//Clears the bitset
@@ -77,7 +140,7 @@ KReturn Server::Init(uint16_t port, uint32_t ChatCap)
 
 
 		//Loop through all the ready sockets
-		for (int i = 0; i <= ReadySet.fd_count; i++)
+		for (int i = 0; i < ReadySet.fd_count; i++)
 		{
 			//The ready socket
 			SOCKET s = ReadySet.fd_array[i];
@@ -140,9 +203,73 @@ KReturn Server::Init(uint16_t port, uint32_t ChatCap)
 		}
 
 	}
-
+	PublicLog.close();
+	StopBroadCast();
+	WSACleanup();
 	return KReturn::SUCCESS;
 }
+
+void Server::BroadCastLoop(uint32_t intervalSeconds)
+{
+	int ErrCode = 0;
+
+	// Create UDP socket 
+	UdpBroadcastSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (UdpBroadcastSocket == INVALID_SOCKET)
+	{
+		ErrCode = WSAGetLastError();
+		printf("Failed to create UDP broadcast socket. Error: %d\n", ErrCode);
+		return;
+	}
+	//Allow broadcast packets
+	BOOL enableBroadCast = TRUE;
+	if (setsockopt(
+		UdpBroadcastSocket,
+		SOL_SOCKET, // The socket option
+		SO_BROADCAST, //congifures a socket for sending broadcast data
+		reinterpret_cast<const char*>(&enableBroadCast),
+		sizeof(enableBroadCast) == SOCKET_ERROR))
+	{
+		ErrCode = WSAGetLastError();
+		printf("Failed to enable SO_BROADCAST. Error: %d\n", ErrCode);
+		closesocket(UdpBroadcastSocket);
+		UdpBroadcastSocket = INVALID_SOCKET;
+		return;
+	}
+
+	// Build broadcast destination address
+	
+	memset(&BroadcastAddr, 0, sizeof(BroadcastAddr));
+	BroadcastAddr.sin_family = AF_INET;
+	BroadcastAddr.sin_port = htons(AdvertisedServerPort);
+
+	// 255.255.255.255
+	BroadcastAddr.sin_addr.s_addr = INADDR_BROADCAST;
+
+	while (UdpBroadcastRunning)
+	{
+		std::string message = BuildBroadcastMessage();
+
+		int sent = sendto(
+			UdpBroadcastSocket,
+			message.c_str(),
+			static_cast<int>(message.size()),
+			0,
+			reinterpret_cast<sockaddr*>(&BroadcastAddr),
+			sizeof(BroadcastAddr));
+		if (sent == SOCKET_ERROR)
+		{
+			ErrCode = WSAGetLastError();
+			printf("UDP broadcast send failed. Error: %d\n", ErrCode);
+		}
+		std::this_thread::sleep_for(std::chrono::seconds(intervalSeconds));
+	}
+
+	closesocket(UdpBroadcastSocket);
+	UdpBroadcastSocket = INVALID_SOCKET;
+
+}
+
 
 int Server::send_all(SOCKET s, const char* msg, int len)
 {
@@ -264,6 +391,8 @@ KReturn Server::server_commands(SOCKET s, const char* buffer)
 			send_packet(s, "You must ~login before sending messages");
 			return KReturn::UNKNOWN;
 		}
+		BroadCastPublic(s, CommandInput);
+		return KReturn::SUCCESS;
 		
 	}
 
@@ -382,6 +511,127 @@ KReturn Server::server_commands(SOCKET s, const char* buffer)
 			UserToSocket[username] = s;
 			send_packet(s, "Login successful. Welcome to KOS COMS");
 			return KReturn::SUCCESS;
+		}
+		case ServerCommands::getlist:
+		{
+			//if the users isnt logined in
+			if (!LoggedIn(s))
+			{
+				ServerMessage(s, "~Login first");
+				return KReturn::UNKNOWN;
+			}
+			
+			std::string out = "Active clients(logged in):\n";
+			for (const auto& ActiveClients : SocketToUser)
+				out += " - " + ActiveClients.second + "\n";
+			ServerMessage(s, out);
+			return KReturn::SUCCESS;
+			
+		}
+		case ServerCommands::logout:
+		{
+			//Erase users using logout
+			if (!LoggedIn(s))
+			{
+				ServerMessage(s, "~login first please");
+				return KReturn::UNKNOWN;
+			}
+
+			std::string out = "User logged out: ";
+			for (const auto& Client : SocketToUser)
+			{
+				if (Client.first == s)
+				{
+					out += Client.second;
+					break;
+				}
+				else
+				{
+					continue;
+				}
+			}
+
+			for (const auto& ActiveClients : SocketToUser)
+			{
+				ServerMessage(s, out);
+			}
+
+			FD_CLR(s, &MasterSet);
+			shutdown(s, SD_BOTH);
+			closesocket(s);
+			return KReturn::SUCCESS;
+		}
+		case ServerCommands::getlog:
+		{
+			if (!LoggedIn(s))
+			{
+				ServerMessage(s, "~login first please");
+				return KReturn::UNKNOWN;
+			}
+
+			std::ifstream in(PublicLogPath, std::ios::in);
+			if (!in.is_open())
+			{
+				ServerMessage(s, "No public log found yet.");
+				return KReturn::UNKNOWN;
+			}
+
+			std::ostringstream ss;
+			ss << in.rdbuf();
+			std::string content = ss.str();
+			if (content.empty())
+			{
+				content = "Public log is empty\n";
+			}
+
+			ServerMessage(s, "Public Message Log\n");
+			ServerMessage(s, content);
+			ServerMessage(s, "End of log\n");
+			return KReturn::SUCCESS;
+		}
+		case ServerCommands::send:
+		{
+			if (!LoggedIn(s))
+			{
+				ServerMessage(s, "~login first please");
+				return KReturn::UNKNOWN;
+			}
+
+			std::istringstream iss(CommandInput);
+			std::string cmd, target;
+			iss >> cmd >> target;
+			std::string message;
+			std::getline(iss, message);
+
+			if (!message.empty() && message[0] == ' ')
+				message.erase(0, 1);
+
+			if (target.empty() || message.empty())
+			{
+				ServerMessage(s, "Usage: ~send <username> <message>");
+				return KReturn::UNKNOWN;
+			}
+
+			auto ClientTo = UserToSocket.find(target);
+			if (ClientTo == UserToSocket.end())
+			{
+				ServerMessage(s, "User '" + target + "' is not online.");
+				return KReturn::UNKNOWN;
+			}
+
+			auto ClientFrom = SocketToUser.find(s);
+			std::string fromUser = ClientFrom->second;
+			SOCKET toSock = ClientTo->second;
+
+			std::string outToTarget = "[DM] " + fromUser + ": " + message + "\n";
+			send_packet(toSock, outToTarget.c_str());
+			ServerMessage(s, "DM sent to '" + target + "'.");
+			return KReturn::SUCCESS;
+		}
+		case ServerCommands::Unknown:
+		{
+			ServerMessage(s, "Unknown command sent to server, please use ~help to see the list of commands");
+			return KReturn::UNKNOWN;
 		}
 	}
 	return KReturn::UNKNOWN;
